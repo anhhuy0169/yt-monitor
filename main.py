@@ -5,10 +5,10 @@ from contextlib import asynccontextmanager
 import urllib.request, urllib.parse
 
 # ===================== CONFIG =====================
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "8629444233:AAHuDd3Z7OMmW3O2NpZNR09_IgIpDWlPkfA")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8629444233:AAHuDd3Z7OMmW3O2NpZNR09_IgIpDWlPkfA")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8058190656")
-CALLBACK_URL    = os.environ.get("CALLBACK_URL", "")   # set trên Render
-HUB_URL         = "https://pubsubhubbub.appspot.com/subscribe"
+CALLBACK_URL     = os.environ.get("CALLBACK_URL", "")
+HUB_URL          = "https://pubsubhubbub.appspot.com/subscribe"
 
 CHANNEL_IDS = [
     "UCx7mKeu3e3F5XoD65_69XLQ",
@@ -43,10 +43,8 @@ def send_telegram(msg: str):
 seen_video_ids = set()
 
 def poll_rss():
-    """Polling RSS mỗi 60 giây — backup khi YouTube không push"""
     global seen_video_ids
     print("[RSS] Bắt đầu polling...")
-    # Khởi tạo seen_ids lần đầu (không thông báo video cũ)
     for cid in CHANNEL_IDS:
         try:
             url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
@@ -68,7 +66,7 @@ def poll_rss():
                 url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
                 res = urllib.request.urlopen(url, timeout=10)
                 root = ET.fromstring(res.read())
-                ns = "{http://www.w3.org/2005/Atom}"
+                ns   = "{http://www.w3.org/2005/Atom}"
                 nsvt = "{http://www.youtube.com/xml/schemas/2015}"
                 for entry in root.findall(f"{ns}entry"):
                     vid_el   = entry.find(f"{nsvt}videoId")
@@ -81,7 +79,7 @@ def poll_rss():
                     title = title_el.text if title_el is not None else "?"
                     pub   = pub_el.text   if pub_el   is not None else ""
                     try:
-                        pub_utc = datetime.fromisoformat(pub.replace("Z","+00:00"))
+                        pub_utc = datetime.fromisoformat(pub.replace("Z", "+00:00"))
                         pub_vn  = pub_utc + timedelta(hours=7)
                         pub_str = pub_vn.strftime("%d/%m/%Y %H:%M")
                     except:
@@ -117,11 +115,25 @@ def subscribe_all():
         except Exception as e:
             print(f"[SUB ERROR] {cid}: {e}")
 
+# ===================== KEEP ALIVE =====================
+def keep_alive():
+    time.sleep(60)
+    while True:
+        try:
+            url = os.environ.get("CALLBACK_URL", "").replace("/youtube/callback", "")
+            if url:
+                urllib.request.urlopen(url, timeout=10)
+                print("[PING] Keep alive OK")
+        except Exception as e:
+            print(f"[PING] {e}")
+        time.sleep(600)
+
 # ===================== FASTAPI =====================
 @asynccontextmanager
 async def lifespan(app):
     threading.Thread(target=subscribe_all, daemon=True).start()
     threading.Thread(target=poll_rss, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -152,9 +164,8 @@ async def callback(request: Request):
             pub   = entry.find(f"{ns}published").text
             ch_id = entry.find(f"{nsvt}channelId").text
 
-            pub_utc = datetime.fromisoformat(pub.replace("Z","+00:00"))
+            pub_utc = datetime.fromisoformat(pub.replace("Z", "+00:00"))
             pub_vn  = pub_utc + timedelta(hours=7)
-            now_vn  = datetime.now(timezone.utc) + timedelta(hours=7)
             delay   = (datetime.now(timezone.utc) - pub_utc).total_seconds()
 
             print(f"[PUSH] {ch_id} | {vid} | delay={delay:.0f}s")
