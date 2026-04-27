@@ -513,3 +513,8 @@ async def root():
         "interval": INTERVAL,
         "seen":     seen_counts,
     }
+
+# Thêm dòng này để fix HEAD 405
+@app.head("/")
+async def root_head():
+    return {}
