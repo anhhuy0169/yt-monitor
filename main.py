@@ -71,17 +71,17 @@ def parse_relative_time(text: str) -> datetime | None:
     t = text.lower().strip()
     now = datetime.now(timezone.utc)
 
-    if any(x in t for x in ["just now", "방금", "gerade", "à l'instant", "adesso"]):
+    if any(x in t for x in ["just now", "방금", "gerade","vừa xong", "à l'instant", "adesso"]):
         return now
 
     patterns = [
-        (r"(\d+)\s*(?:second|sec|초|секунд|sekund)",    "seconds"),
-        (r"(\d+)\s*(?:minute|min|분|минут|minut)",       "minutes"),
-        (r"(\d+)\s*(?:hour|hr|시간|час|ore|stund)",      "hours"),
-        (r"(\d+)\s*(?:day|일|день|дн|gün|dag)",          "days"),
-        (r"(\d+)\s*(?:week|주|недел|semain|semana)",      "weeks"),
-        (r"(\d+)\s*(?:month|개월|месяц|mois|mes)",       "months"),
-        (r"(\d+)\s*(?:year|년|год|лет|an\b|año)",        "years"),
+        (r"(\d+)\s*(?:giờ|tiếng)",     "hours"),
+        (r"(\d+)\s*(?:phút)",          "minutes"),
+        (r"(\d+)\s*(?:giây)",          "seconds"),
+        (r"(\d+)\s*(?:ngày)",          "days"),
+        (r"(\d+)\s*(?:tuần)",          "weeks"),
+        (r"(\d+)\s*(?:tháng)",         "months"),
+        (r"(\d+)\s*(?:năm)",           "years"),
     ]
     for pattern, unit in patterns:
         m = re.search(pattern, t)
@@ -127,20 +127,132 @@ def fetch_html(url: str) -> str:
         return res.read().decode("utf-8", errors="replace")
 
 def parse_videos(html: str, max_count: int = 10) -> list:
-    m = re.search(
-        r"(?:var\s+)?ytInitialData\s*=\s*(\{.+?\});\s*(?:</script>|var\s+)",
+    import re
+    videos = []
+    seen = set()
+
+    # Parser mới: dùng regex trên raw HTML (works với cả server-fetched HTML)
+    # Tìm tất cả video block theo pattern href="/watch?v=VIDEO_ID"
+    # và lấy title từ attribute title= của thẻ h3 hoặc a
+
+    # Pattern 1: ytInitialData JSON (ưu tiên)
+    m = re.search(r'ytInitialData\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            videos = _parse_from_json(data, max_count)
+            if videos:
+                return videos
+        except Exception as e:
+            log.warning(f"[PARSE] ytInitialData JSON lỗi: {e}")
+
+    # Pattern 2: Parse HTML trực tiếp từ DOM mới (yt-lockup-view-model)
+    log.warning("[PARSE] Dùng HTML parser mới (yt-lockup-view-model)")
+
+    # Tìm tất cả cặp (video_id, title, age, views) từ HTML
+    # Video ID từ href="/watch?v=XXX" hoặc class="...content-id-XXX..."
+    blocks = re.findall(
+        r'class="[^"]*content-id-([A-Za-z0-9_-]{11})[^"]*".*?'
+        r'<h3[^>]*title="([^"]+)".*?'
+        r'<div[^>]*ytContentMetadataViewModelMetadataRow[^>]*>(.*?)</div>',
         html, re.DOTALL
     )
-    if not m:
-        raise RuntimeError("Không tìm thấy ytInitialData")
 
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"JSON parse thất bại: {e}")
+    for vid_id, title, meta_block in blocks:
+        if vid_id in seen or len(videos) >= max_count:
+            break
+        seen.add(vid_id)
 
+        # Lấy tất cả text từ span trong meta_block
+        spans = re.findall(r'<span[^>]*>([^<]+)</span>', meta_block)
+        age_text = None
+        views_text = None
+        for span in spans:
+            span = span.strip()
+            # Age: chứa "trước", "ago", "前", "전" ...
+            if any(x in span for x in ["trước", "ago", "前", "전", "назад", "vor", "hace"]):
+                age_text = span
+            # Views: chứa "lượt", "view", "조회", "回"
+            elif any(x in span for x in ["lượt", "view", "조회", "回", "просмотр"]):
+                views_text = span
+
+        videos.append({
+            "id":         vid_id,
+            "title":      title,
+            "url":        f"https://www.youtube.com/watch?v={vid_id}",
+            "age_text":   age_text,
+            "age_dt":     parse_relative_time(age_text),
+            "views":      parse_view_count(views_text),
+            "views_text": views_text,
+        })
+
+    if not videos:
+        log.warning("[PARSE] Fallback: regex đơn giản (không có age/view)")
+        for vid_id, title in re.findall(
+            r'href="/watch\?v=([A-Za-z0-9_-]{11})"[^>]*>\s*<[^>]+>\s*([^<]{10,})',
+            html
+        ):
+            if vid_id not in seen:
+                seen.add(vid_id)
+                videos.append({
+                    "id": vid_id, "title": title.strip(),
+                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                    "age_text": None, "age_dt": None,
+                    "views": None, "views_text": None,
+                })
+            if len(videos) >= max_count:
+                break
+
+    return videos
+
+
+def _parse_from_json(data: dict, max_count: int) -> list:
+    """Parse ytInitialData JSON - cấu trúc cũ và mới"""
     videos = []
-    seen   = set()
+    seen = set()
+
+    def extract_video(vi: dict):
+        vid_id = vi.get("videoId")
+        if not vid_id or vid_id in seen:
+            return
+        seen.add(vid_id)
+        title = "".join(r.get("text", "") for r in vi.get("title", {}).get("runs", []))
+        if not title:
+            title = vi.get("title", {}).get("simpleText", "")
+        age_text = (
+            vi.get("publishedTimeText", {}).get("simpleText")
+            or (vi.get("publishedTimeText", {}).get("runs") or [{}])[0].get("text")
+        )
+        vct = vi.get("viewCountText", {})
+        views_text = vct.get("simpleText") or "".join(
+            r.get("text", "") for r in vct.get("runs", [])
+        )
+        videos.append({
+            "id": vid_id, "title": title,
+            "url": f"https://www.youtube.com/watch?v={vid_id}",
+            "age_text": age_text, "age_dt": parse_relative_time(age_text),
+            "views": parse_view_count(views_text), "views_text": views_text,
+        })
+        return len(videos) >= max_count
+
+    def walk(obj):
+        if len(videos) >= max_count:
+            return
+        if isinstance(obj, dict):
+            for key in ("videoRenderer", "gridVideoRenderer", "richItemRenderer"):
+                if key in obj:
+                    vi = obj[key]
+                    if key == "richItemRenderer":
+                        vi = vi.get("content", {}).get("videoRenderer", {})
+                    extract_video(vi)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return videos
 
     def extract_video(vi: dict) -> dict | None:
         vid_id = vi.get("videoId")
