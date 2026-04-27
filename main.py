@@ -21,17 +21,21 @@ INTERVAL         = int(os.environ.get("INTERVAL", 60))
 MAX_VIDEO_AGE_HOURS = float(os.environ.get("MAX_VIDEO_AGE_HOURS", "6"))
 MAX_VIEW_COUNT      = int(os.environ.get("MAX_VIEW_COUNT", "50000"))  # 0 = tắt
 
+# URL của app trên Render để tự ping, tránh bị sleep (free tier)
+# Ví dụ: https://yt-monitor.onrender.com
+RENDER_URL = os.environ.get("RENDER_URL", "")
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt_state.json")
 
 CHANNELS = [
-    {"url": "https://www.youtube.com/@%EC%84%9C%EC%A0%95%EC%9A%B1TV/videos", "name": "서정욱TV"},
-    {"url": "https://www.youtube.com/@KBSnews/videos",                        "name": "KBS News"},
-    {"url": "https://www.youtube.com/@YTN_news/videos",                       "name": "YTN"},
-    {"url": "https://www.youtube.com/@mbc_news_official/videos",              "name": "MBC News"},
-    {"url": "https://www.youtube.com/@JTBC_news/videos",                      "name": "JTBC News"},
-    {"url": "https://www.youtube.com/@OhmynewsTV/videos",                     "name": "OhmynewsTV"},
-    {"url": "https://www.youtube.com/@yonhapnewstv/videos",                   "name": "Yonhap News"},
-    {"url": "https://www.youtube.com/@channelA_news/videos",                  "name": "Channel A"},
+    {"url": "https://www.youtube.com/channel/UCx7mKeu3e3F5XoD65_69XLQ/videos", "name": "UCx7mKeu3e3F5XoD65_69XLQ"},
+    {"url": "https://www.youtube.com/channel/UCDNg-F0nDTWwrCFZxRWVShQ/videos", "name": "UCDNg-F0nDTWwrCFZxRWVShQ"},
+    {"url": "https://www.youtube.com/channel/UCLolgwyJNsUCnEvr41-DuHQ/videos", "name": "UCLolgwyJNsUCnEvr41-DuHQ"},
+    {"url": "https://www.youtube.com/channel/UCp6WQCReo512WxExm7u6Vyg/videos", "name": "UCp6WQCReo512WxExm7u6Vyg"},
+    {"url": "https://www.youtube.com/channel/UCsz3EZKmnnlBHkZsNHtOquw/videos", "name": "UCsz3EZKmnnlBHkZsNHtOquw"},
+    {"url": "https://www.youtube.com/channel/UCgHG6kRpULWaJ1AGUr2pOXQ/videos", "name": "UCgHG6kRpULWaJ1AGUr2pOXQ"},
+    {"url": "https://www.youtube.com/channel/UCNzWZmsJ2QmBss30LeZZTdg/videos", "name": "UCNzWZmsJ2QmBss30LeZZTdg"},
+    {"url": "https://www.youtube.com/channel/UCLXQlPDLHcTOYWVtj5N6fOg/videos", "name": "UCLXQlPDLHcTOYWVtj5N6fOg"},
 ]
 
 # ===================== LOGGING =====================
@@ -278,6 +282,22 @@ def notify(video: dict, channel_name: str):
         except Exception as e2:
             log.error(f"[TG ❌] Thất bại hoàn toàn: {e2}")
 
+# ===================== KEEP ALIVE =====================
+def keep_alive(stop_event: threading.Event):
+    """Tự ping chính nó mỗi 10 phút để Render free tier không sleep."""
+    if not RENDER_URL:
+        log.info("[PING] RENDER_URL chưa set, bỏ qua keep-alive")
+        return
+    log.info(f"[PING] Keep-alive bật → {RENDER_URL}")
+    stop_event.wait(timeout=60)   # chờ app khởi động xong rồi mới ping
+    while not stop_event.is_set():
+        try:
+            urllib.request.urlopen(RENDER_URL, timeout=10)
+            log.info("[PING] ✅ OK")
+        except Exception as e:
+            log.warning(f"[PING] ⚠️ {e}")
+        stop_event.wait(timeout=600)   # 10 phút
+
 # ===================== WORKER =====================
 def channel_worker(channel: dict, stop_event: threading.Event):
     url  = channel["url"]
@@ -345,6 +365,10 @@ async def lifespan(app: FastAPI):
     log.info("=" * 50)
 
     threads = []
+    t_ping = threading.Thread(target=keep_alive, args=(_stop_event,), name="keep-alive", daemon=True)
+    t_ping.start()
+    threads.append(t_ping)
+
     for ch in CHANNELS:
         t = threading.Thread(
             target=channel_worker,
