@@ -296,7 +296,7 @@ def keep_alive(stop_event: threading.Event):
             log.info("[PING] ✅ OK")
         except Exception as e:
             log.warning(f"[PING] ⚠️ {e}")
-        stop_event.wait(timeout=600)   # 10 phút
+        stop_event.wait(timeout=300)   # 10 phút
 
 # ===================== WORKER =====================
 def channel_worker(channel: dict, stop_event: threading.Event):
