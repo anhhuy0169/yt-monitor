@@ -36,7 +36,6 @@ CHANNELS = [
     {"url": "https://www.youtube.com/channel/UCgHG6kRpULWaJ1AGUr2pOXQ/videos", "name": "UCgHG6kRpULWaJ1AGUr2pOXQ"},
     {"url": "https://www.youtube.com/channel/UCNzWZmsJ2QmBss30LeZZTdg/videos", "name": "UCNzWZmsJ2QmBss30LeZZTdg"},
     {"url": "https://www.youtube.com/channel/UCLXQlPDLHcTOYWVtj5N6fOg/videos", "name": "UCLXQlPDLHcTOYWVtj5N6fOg"},
-    {"url": "https://www.youtube.com/channel/UC4x-T7FgY0-n8jPT1NWfg2A/videos", "name": "팬더경제학"},
 ]
 
 # ===================== LOGGING =====================
