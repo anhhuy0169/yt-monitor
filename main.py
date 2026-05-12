@@ -1,13 +1,14 @@
 """
-YT Channel Monitor
-- uvicorn main:app --host 0.0.0.0 --port $PORT
-- Scrape HTML trang /videos, không cần webhook/ngrok
+YT Channel Monitor — RSS Edition
+- Không scrape HTML, không cần API key
+- Dùng YouTube RSS feed chính thức (cập nhật ~1-2 phút sau khi upload)
 - Đa luồng, mỗi kênh 1 worker thread
-- Filter video cũ bằng publishedTimeText + viewCount
+- Filter video cũ bằng published timestamp chính xác
 - Gửi Telegram khi có video mới
+- uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
-import os, json, re, time, threading, logging
+import os, json, re, time, threading, logging, gzip, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import urllib.request, urllib.error
@@ -15,28 +16,30 @@ import urllib.request, urllib.error
 from fastapi import FastAPI
 
 # ===================== CONFIG =====================
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-INTERVAL         = int(os.environ.get("INTERVAL", 60))
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "")
+INTERVAL            = int(os.environ.get("INTERVAL",        "60"))   # giây
 MAX_VIDEO_AGE_HOURS = float(os.environ.get("MAX_VIDEO_AGE_HOURS", "6"))
-MAX_VIEW_COUNT      = int(os.environ.get("MAX_VIEW_COUNT", "50000"))  # 0 = tắt
 
-# URL của app trên Render để tự ping, tránh bị sleep (free tier)
-# Ví dụ: https://yt-monitor.onrender.com
+# URL app trên Render để tự ping, tránh sleep (free tier)
 RENDER_URL = os.environ.get("RENDER_URL", "")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yt_state.json")
 
+# Chỉ cần channel_id — RSS tự động build từ đây
 CHANNELS = [
-    {"url": "https://www.youtube.com/channel/UCx7mKeu3e3F5XoD65_69XLQ/videos", "name": "UCx7mKeu3e3F5XoD65_69XLQ"},
-    {"url": "https://www.youtube.com/channel/UCDNg-F0nDTWwrCFZxRWVShQ/videos", "name": "UCDNg-F0nDTWwrCFZxRWVShQ"},
-    {"url": "https://www.youtube.com/channel/UCLolgwyJNsUCnEvr41-DuHQ/videos", "name": "UCLolgwyJNsUCnEvr41-DuHQ"},
-    {"url": "https://www.youtube.com/channel/UCp6WQCReo512WxExm7u6Vyg/videos", "name": "UCp6WQCReo512WxExm7u6Vyg"},
-    {"url": "https://www.youtube.com/channel/UCsz3EZKmnnlBHkZsNHtOquw/videos", "name": "UCsz3EZKmnnlBHkZsNHtOquw"},
-    {"url": "https://www.youtube.com/channel/UCgHG6kRpULWaJ1AGUr2pOXQ/videos", "name": "UCgHG6kRpULWaJ1AGUr2pOXQ"},
-    {"url": "https://www.youtube.com/channel/UCNzWZmsJ2QmBss30LeZZTdg/videos", "name": "UCNzWZmsJ2QmBss30LeZZTdg"},
-    {"url": "https://www.youtube.com/channel/UCLXQlPDLHcTOYWVtj5N6fOg/videos", "name": "UCLXQlPDLHcTOYWVtj5N6fOg"},
+    {"id": "UCx7mKeu3e3F5XoD65_69XLQ", "name": "Kênh 1"},
+    {"id": "UCDNg-F0nDTWwrCFZxRWVShQ", "name": "Kênh 2"},
+    {"id": "UCLolgwyJNsUCnEvr41-DuHQ", "name": "Kênh 3"},
+    {"id": "UCp6WQCReo512WxExm7u6Vyg", "name": "Kênh 4"},
+    {"id": "UCsz3EZKmnnlBHkZsNHtOquw", "name": "Kênh 5"},
+    {"id": "UCgHG6kRpULWaJ1AGUr2pOXQ", "name": "Kênh 6"},
+    {"id": "UCNzWZmsJ2QmBss30LeZZTdg", "name": "Kênh 7"},
+    {"id": "UCLXQlPDLHcTOYWVtj5N6fOg", "name": "Kênh 8"},
 ]
+
+def rss_url(channel_id: str) -> str:
+    return f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -64,295 +67,84 @@ def save_state(state: dict):
 
 _state: dict = load_state()
 
-# ===================== TIME / VIEW PARSER =====================
-def parse_relative_time(text: str) -> datetime | None:
-    if not text:
-        return None
-    t = text.lower().strip()
-    now = datetime.now(timezone.utc)
-
-    if any(x in t for x in ["just now", "방금", "gerade","vừa xong", "à l'instant", "adesso"]):
-        return now
-
-    patterns = [
-        (r"(\d+)\s*(?:giờ|tiếng)",     "hours"),
-        (r"(\d+)\s*(?:phút)",          "minutes"),
-        (r"(\d+)\s*(?:giây)",          "seconds"),
-        (r"(\d+)\s*(?:ngày)",          "days"),
-        (r"(\d+)\s*(?:tuần)",          "weeks"),
-        (r"(\d+)\s*(?:tháng)",         "months"),
-        (r"(\d+)\s*(?:năm)",           "years"),
-    ]
-    for pattern, unit in patterns:
-        m = re.search(pattern, t)
-        if m:
-            n = int(m.group(1))
-            delta = {
-                "seconds": timedelta(seconds=n),
-                "minutes": timedelta(minutes=n),
-                "hours":   timedelta(hours=n),
-                "days":    timedelta(days=n),
-                "weeks":   timedelta(weeks=n),
-                "months":  timedelta(days=n * 30),
-                "years":   timedelta(days=n * 365),
-            }[unit]
-            return now - delta
-    return None
-
-def parse_view_count(text: str) -> int | None:
-    if not text:
-        return None
-    t = text.lower().replace(",", "").replace(" ", "")
-    m = re.search(r"([\d.]+)\s*([kmb만억]?)\s*(?:view|조회|просмотр)?", t)
-    if not m:
-        return None
-    num = float(m.group(1))
-    mult = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000,
-            "만": 10_000, "억": 100_000_000}.get(m.group(2), 1)
-    return int(num * mult)
-
-# ===================== SCRAPER =====================
+# ===================== RSS FETCHER =====================
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "User-Agent":      "Mozilla/5.0 (compatible; YTMonitor/2.0)",
+    "Accept":          "application/atom+xml,application/xml,text/xml,*/*",
+    "Accept-Encoding": "gzip, deflate",
 }
 
-def fetch_html(url: str) -> str:
+def fetch_rss(channel_id: str) -> list[dict]:
+    """
+    Fetch RSS feed và trả về list video mới nhất.
+    Mỗi item: {id, title, url, published, published_dt, channel_name, channel_url}
+    """
+    url = rss_url(channel_id)
     req = urllib.request.Request(url, headers=HEADERS)
+
     with urllib.request.urlopen(req, timeout=15) as res:
-        return res.read().decode("utf-8", errors="replace")
+        raw = res.read()
+        if res.info().get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
 
-def parse_videos(html: str, max_count: int = 10) -> list:
-    import re
+    # YouTube RSS dùng Atom format
+    NS = {
+        "atom":  "http://www.w3.org/2005/Atom",
+        "yt":    "http://www.youtube.com/xml/schemas/2015",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+
+    root = ET.fromstring(raw)
+
+    channel_title_el = root.find("atom:title", NS)
+    channel_name = channel_title_el.text if channel_title_el is not None else channel_id
+
+    channel_link_el = root.find("atom:link[@rel='alternate']", NS)
+    channel_url = channel_link_el.get("href", "") if channel_link_el is not None else ""
+
     videos = []
-    seen = set()
+    for entry in root.findall("atom:entry", NS):
+        vid_id_el = entry.find("yt:videoId", NS)
+        if vid_id_el is None:
+            continue
+        vid_id = vid_id_el.text.strip()
 
-    # Parser mới: dùng regex trên raw HTML (works với cả server-fetched HTML)
-    # Tìm tất cả video block theo pattern href="/watch?v=VIDEO_ID"
-    # và lấy title từ attribute title= của thẻ h3 hoặc a
+        title_el = entry.find("atom:title", NS)
+        title = title_el.text.strip() if title_el is not None else vid_id
 
-    # Pattern 1: ytInitialData JSON (ưu tiên)
-    m = re.search(r'ytInitialData\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
-    if m:
-        try:
-            data = json.loads(m.group(1))
-            videos = _parse_from_json(data, max_count)
-            if videos:
-                return videos
-        except Exception as e:
-            log.warning(f"[PARSE] ytInitialData JSON lỗi: {e}")
+        published_el = entry.find("atom:published", NS)
+        published_str = published_el.text.strip() if published_el is not None else ""
 
-    # Pattern 2: Parse HTML trực tiếp từ DOM mới (yt-lockup-view-model)
-    log.warning("[PARSE] Dùng HTML parser mới (yt-lockup-view-model)")
-
-    # Tìm tất cả cặp (video_id, title, age, views) từ HTML
-    # Video ID từ href="/watch?v=XXX" hoặc class="...content-id-XXX..."
-    blocks = re.findall(
-        r'class="[^"]*content-id-([A-Za-z0-9_-]{11})[^"]*".*?'
-        r'<h3[^>]*title="([^"]+)".*?'
-        r'<div[^>]*ytContentMetadataViewModelMetadataRow[^>]*>(.*?)</div>',
-        html, re.DOTALL
-    )
-
-    for vid_id, title, meta_block in blocks:
-        if vid_id in seen or len(videos) >= max_count:
-            break
-        seen.add(vid_id)
-
-        # Lấy tất cả text từ span trong meta_block
-        spans = re.findall(r'<span[^>]*>([^<]+)</span>', meta_block)
-        age_text = None
-        views_text = None
-        for span in spans:
-            span = span.strip()
-            # Age: chứa "trước", "ago", "前", "전" ...
-            if any(x in span for x in ["trước", "ago", "前", "전", "назад", "vor", "hace"]):
-                age_text = span
-            # Views: chứa "lượt", "view", "조회", "回"
-            elif any(x in span for x in ["lượt", "view", "조회", "回", "просмотр"]):
-                views_text = span
+        published_dt = None
+        if published_str:
+            try:
+                published_dt = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
+            except ValueError:
+                pass
 
         videos.append({
-            "id":         vid_id,
-            "title":      title,
-            "url":        f"https://www.youtube.com/watch?v={vid_id}",
-            "age_text":   age_text,
-            "age_dt":     parse_relative_time(age_text),
-            "views":      parse_view_count(views_text),
-            "views_text": views_text,
+            "id":           vid_id,
+            "title":        title,
+            "url":          f"https://www.youtube.com/watch?v={vid_id}",
+            "published":    published_str,
+            "published_dt": published_dt,
+            "channel_name": channel_name,
+            "channel_url":  channel_url,
         })
-
-    if not videos:
-        log.warning("[PARSE] Fallback: regex đơn giản (không có age/view)")
-        for vid_id, title in re.findall(
-            r'href="/watch\?v=([A-Za-z0-9_-]{11})"[^>]*>\s*<[^>]+>\s*([^<]{10,})',
-            html
-        ):
-            if vid_id not in seen:
-                seen.add(vid_id)
-                videos.append({
-                    "id": vid_id, "title": title.strip(),
-                    "url": f"https://www.youtube.com/watch?v={vid_id}",
-                    "age_text": None, "age_dt": None,
-                    "views": None, "views_text": None,
-                })
-            if len(videos) >= max_count:
-                break
-
-    return videos
-
-
-def _parse_from_json(data: dict, max_count: int) -> list:
-    """Parse ytInitialData JSON - cấu trúc cũ và mới"""
-    videos = []
-    seen = set()
-
-    def extract_video(vi: dict):
-        vid_id = vi.get("videoId")
-        if not vid_id or vid_id in seen:
-            return
-        seen.add(vid_id)
-        title = "".join(r.get("text", "") for r in vi.get("title", {}).get("runs", []))
-        if not title:
-            title = vi.get("title", {}).get("simpleText", "")
-        age_text = (
-            vi.get("publishedTimeText", {}).get("simpleText")
-            or (vi.get("publishedTimeText", {}).get("runs") or [{}])[0].get("text")
-        )
-        vct = vi.get("viewCountText", {})
-        views_text = vct.get("simpleText") or "".join(
-            r.get("text", "") for r in vct.get("runs", [])
-        )
-        videos.append({
-            "id": vid_id, "title": title,
-            "url": f"https://www.youtube.com/watch?v={vid_id}",
-            "age_text": age_text, "age_dt": parse_relative_time(age_text),
-            "views": parse_view_count(views_text), "views_text": views_text,
-        })
-        return len(videos) >= max_count
-
-    def walk(obj):
-        if len(videos) >= max_count:
-            return
-        if isinstance(obj, dict):
-            for key in ("videoRenderer", "gridVideoRenderer", "richItemRenderer"):
-                if key in obj:
-                    vi = obj[key]
-                    if key == "richItemRenderer":
-                        vi = vi.get("content", {}).get("videoRenderer", {})
-                    extract_video(vi)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    walk(data)
-    return videos
-
-    def extract_video(vi: dict) -> dict | None:
-        vid_id = vi.get("videoId")
-        if not vid_id or vid_id in seen:
-            return None
-        seen.add(vid_id)
-        title = "".join(r.get("text", "") for r in vi.get("title", {}).get("runs", []))
-        age_text = (
-            vi.get("publishedTimeText", {}).get("simpleText")
-            or vi.get("publishedTimeText", {}).get("runs", [{}])[0].get("text")
-        )
-        vct = vi.get("viewCountText", {})
-        views_text = (
-            vct.get("simpleText")
-            or "".join(r.get("text", "") for r in vct.get("runs", []))
-        )
-        return {
-            "id":         vid_id,
-            "title":      title,
-            "url":        f"https://www.youtube.com/watch?v={vid_id}",
-            "age_text":   age_text,
-            "age_dt":     parse_relative_time(age_text),
-            "views":      parse_view_count(views_text),
-            "views_text": views_text,
-        }
-
-    def try_extract(items: list) -> bool:
-        for item in items:
-            vi = (
-                item.get("richItemRenderer", {}).get("content", {}).get("videoRenderer")
-                or item.get("gridVideoRenderer")
-                or item.get("videoRenderer")
-            )
-            if vi:
-                v = extract_video(vi)
-                if v:
-                    videos.append(v)
-            if len(videos) >= max_count:
-                return True
-        return False
-
-    try:
-        tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
-        for tab in tabs:
-            tr = tab.get("tabRenderer", {})
-            if not tr.get("selected"):
-                continue
-            content = tr.get("content", {})
-            items = content.get("richGridRenderer", {}).get("contents", [])
-            if items:
-                try_extract(items)
-            if videos:
-                break
-            for section in content.get("sectionListRenderer", {}).get("contents", []):
-                for inner in section.get("itemSectionRenderer", {}).get("contents", []):
-                    if try_extract(inner.get("gridRenderer", {}).get("items", [])):
-                        break
-                if videos:
-                    break
-            if videos:
-                break
-    except (KeyError, TypeError):
-        pass
-
-    # Fallback regex
-    if not videos:
-        log.warning("ytInitialData parse thất bại, dùng fallback regex (không có age/view)")
-        for vid_id, title in re.findall(
-            r'"videoId":"([A-Za-z0-9_-]{11})"[^}]*?"title":\{"runs":\[\{"text":"([^"]+)"',
-            html,
-        ):
-            if vid_id not in seen:
-                seen.add(vid_id)
-                videos.append({
-                    "id": vid_id, "title": title,
-                    "url": f"https://www.youtube.com/watch?v={vid_id}",
-                    "age_text": None, "age_dt": None,
-                    "views": None,    "views_text": None,
-                })
-            if len(videos) >= max_count:
-                break
 
     return videos
 
 # ===================== FILTER =====================
 def is_new_video(v: dict) -> tuple[bool, str]:
-    """
-    (True, "")        → gửi
-    (False, lý do)    → bỏ qua
-    """
+    if v["published_dt"] is None:
+        return True, ""  # không có timestamp → cho qua
+
     now = datetime.now(timezone.utc)
+    age_hours = (now - v["published_dt"]).total_seconds() / 3600
 
-    if v["age_dt"] is not None:
-        age_hours = (now - v["age_dt"]).total_seconds() / 3600
-        if age_hours > MAX_VIDEO_AGE_HOURS:
-            return False, f"quá cũ ({age_hours:.1f}h > {MAX_VIDEO_AGE_HOURS}h) [{v['age_text']}]"
-
-    if MAX_VIEW_COUNT > 0 and v["views"] is not None:
-        if v["views"] > MAX_VIEW_COUNT:
-            return False, f"view quá cao ({v['views']:,} > {MAX_VIEW_COUNT:,})"
+    if age_hours > MAX_VIDEO_AGE_HOURS:
+        age_str = v["published_dt"].strftime("%d/%m %H:%M")
+        return False, f"quá cũ ({age_hours:.1f}h > {MAX_VIDEO_AGE_HOURS}h) [{age_str} UTC]"
 
     return True, ""
 
@@ -360,87 +152,103 @@ def is_new_video(v: dict) -> tuple[bool, str]:
 def _tg_post(endpoint: str, payload: dict):
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{endpoint}"
     data = json.dumps(payload).encode("utf-8")
-    req  = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req  = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"}
+    )
     with urllib.request.urlopen(req, timeout=10) as res:
         return json.loads(res.read())
 
-def notify(video: dict, channel_name: str):
-    vid_id  = video["id"]
-    thumb   = f"https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg"
-    now_vn  = datetime.now(timezone.utc) + timedelta(hours=7)
-    age_line   = f"\n🕓 <b>Đăng:</b> {video['age_text']}" if video["age_text"] else ""
-    views_line = f"\n👁 <b>Views:</b> {video['views_text']}" if video["views_text"] else ""
+def notify(video: dict):
+    vid_id = video["id"]
+    thumb  = f"https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg"
+    now_vn = datetime.now(timezone.utc) + timedelta(hours=7)
+
+    if video["published_dt"]:
+        pub_vn   = video["published_dt"] + timedelta(hours=7)
+        pub_line = f"\n🕓 <b>Đăng lúc:</b> {pub_vn.strftime('%d/%m/%Y %H:%M')} (VN)"
+    else:
+        pub_line = ""
+
     caption = (
         f"🔔 <b>Video mới!</b>\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"📺 <b>Kênh:</b> {channel_name}\n"
+        f"📺 <b>Kênh:</b> <a href='{video['channel_url']}'>{video['channel_name']}</a>\n"
         f"🎬 <b>Video:</b> <a href='{video['url']}'>{video['title']}</a>"
-        f"{age_line}{views_line}\n"
+        f"{pub_line}\n"
         f"🕐 <b>Phát hiện:</b> {now_vn.strftime('%d/%m/%Y %H:%M')} (VN)"
     )
+
     try:
         _tg_post("sendPhoto", {
-            "chat_id": TELEGRAM_CHAT_ID, "photo": thumb,
-            "caption": caption, "parse_mode": "HTML",
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "photo":      thumb,
+            "caption":    caption,
+            "parse_mode": "HTML",
         })
-        log.info(f"[TG ✅] {channel_name} — {video['title'][:60]}")
+        log.info(f"[TG ✅] {video['channel_name']} — {video['title'][:60]}")
     except Exception as e:
         log.warning(f"[TG] sendPhoto lỗi ({e}), fallback sendMessage...")
         try:
             _tg_post("sendMessage", {
-                "chat_id": TELEGRAM_CHAT_ID, "text": caption,
-                "parse_mode": "HTML", "disable_web_page_preview": False,
+                "chat_id":                  TELEGRAM_CHAT_ID,
+                "text":                     caption,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": False,
             })
         except Exception as e2:
             log.error(f"[TG ❌] Thất bại hoàn toàn: {e2}")
 
 # ===================== KEEP ALIVE =====================
 def keep_alive(stop_event: threading.Event):
-    """Tự ping chính nó mỗi 10 phút để Render free tier không sleep."""
     if not RENDER_URL:
         log.info("[PING] RENDER_URL chưa set, bỏ qua keep-alive")
         return
     log.info(f"[PING] Keep-alive bật → {RENDER_URL}")
-    stop_event.wait(timeout=60)   # chờ app khởi động xong rồi mới ping
+    stop_event.wait(timeout=60)
     while not stop_event.is_set():
         try:
             urllib.request.urlopen(RENDER_URL, timeout=10)
             log.info("[PING] ✅ OK")
         except Exception as e:
             log.warning(f"[PING] ⚠️ {e}")
-        stop_event.wait(timeout=300)   # 10 phút
+        stop_event.wait(timeout=300)  # ping mỗi 5 phút
 
 # ===================== WORKER =====================
 def channel_worker(channel: dict, stop_event: threading.Event):
-    url  = channel["url"]
-    name = channel.get("name") or url
+    ch_id = channel["id"]
+    name  = channel.get("name", ch_id)
+    key   = ch_id  # dùng channel_id làm key trong state
 
+    # ── Lần đầu: seed state, không gửi TG ─────────────────────────────────
     with _state_lock:
-        first_run = url not in _state
+        first_run = key not in _state
 
     if first_run:
-        log.info(f"[{name}] Lần đầu — lưu state hiện tại, không gửi TG...")
+        log.info(f"[{name}] Lần đầu — seed state, không gửi TG...")
         try:
-            videos = parse_videos(fetch_html(url))
+            videos = fetch_rss(ch_id)
             with _state_lock:
-                _state[url] = [v["id"] for v in videos]
+                _state[key] = [v["id"] for v in videos]
                 save_state(_state)
-            log.info(f"[{name}] ✅ Lưu {len(videos)} ID")
+            log.info(f"[{name}] ✅ Seed {len(videos)} video ID")
         except Exception as e:
-            log.error(f"[{name}] ❌ Lỗi khởi tạo: {e}")
+            log.error(f"[{name}] ❌ Lỗi seed: {e}")
             with _state_lock:
-                _state[url] = []
+                _state[key] = []
                 save_state(_state)
 
+    # ── Loop chính ─────────────────────────────────────────────────────────
     while not stop_event.is_set():
         stop_event.wait(timeout=INTERVAL)
         if stop_event.is_set():
             break
 
         try:
-            videos     = parse_videos(fetch_html(url))
+            videos = fetch_rss(ch_id)
+
             with _state_lock:
-                seen_ids   = set(_state.get(url, []))
+                seen_ids   = set(_state.get(key, []))
                 candidates = [v for v in videos if v["id"] not in seen_ids]
 
             new_videos = []
@@ -450,15 +258,15 @@ def channel_worker(channel: dict, stop_event: threading.Event):
                     new_videos.append(v)
                 else:
                     log.info(f"[{name}] ⏭ '{v['title'][:40]}' — {reason}")
-                seen_ids.add(v["id"])   # thêm vào seen dù bỏ qua, tránh check lại
+                seen_ids.add(v["id"])
 
             if new_videos:
                 log.info(f"[{name}] 🎉 {len(new_videos)} video mới!")
-                for v in reversed(new_videos):
-                    notify(v, name)
+                for v in reversed(new_videos):  # gửi theo thứ tự cũ → mới
+                    notify(v)
 
             with _state_lock:
-                _state[url] = list(seen_ids)
+                _state[key] = list(seen_ids)
                 save_state(_state)
 
         except Exception as e:
@@ -472,12 +280,16 @@ _stop_event = threading.Event()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=" * 50)
-    log.info(f"YT Monitor | {len(CHANNELS)} kênh | interval={INTERVAL}s")
-    log.info(f"Max age={MAX_VIDEO_AGE_HOURS}h | Max views={MAX_VIEW_COUNT:,}")
+    log.info(f"YT Monitor (RSS) | {len(CHANNELS)} kênh | interval={INTERVAL}s")
+    log.info(f"Max age={MAX_VIDEO_AGE_HOURS}h")
     log.info("=" * 50)
 
     threads = []
-    t_ping = threading.Thread(target=keep_alive, args=(_stop_event,), name="keep-alive", daemon=True)
+
+    t_ping = threading.Thread(
+        target=keep_alive, args=(_stop_event,),
+        name="keep-alive", daemon=True
+    )
     t_ping.start()
     threads.append(t_ping)
 
@@ -485,15 +297,15 @@ async def lifespan(app: FastAPI):
         t = threading.Thread(
             target=channel_worker,
             args=(ch, _stop_event),
-            name=f"worker-{ch.get('name', '?')}",
+            name=f"worker-{ch['id']}",
             daemon=True,
         )
         t.start()
         threads.append(t)
-        log.info(f"▶ {ch.get('name')} ({ch['url']})")
-        time.sleep(0.3)
+        log.info(f"▶ {ch.get('name')} ({ch['id']})")
+        time.sleep(0.2)
 
-    yield   # app đang chạy
+    yield  # app đang chạy
 
     log.info("Shutdown — dừng workers...")
     _stop_event.set()
@@ -506,15 +318,44 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 async def root():
     with _state_lock:
-        seen_counts = {ch["name"]: len(_state.get(ch["url"], [])) for ch in CHANNELS}
+        seen_counts = {
+            ch["name"]: len(_state.get(ch["id"], []))
+            for ch in CHANNELS
+        }
     return {
         "status":   "running",
         "channels": len(CHANNELS),
-        "interval": INTERVAL,
+        "interval": f"{INTERVAL}s",
+        "max_age":  f"{MAX_VIDEO_AGE_HOURS}h",
         "seen":     seen_counts,
     }
 
-# Thêm dòng này để fix HEAD 405
 @app.head("/")
 async def root_head():
     return {}
+
+@app.get("/debug/{channel_index}")
+async def debug_channel(channel_index: int = 0):
+    """Xem RSS parse result của kênh. /debug/0, /debug/1, ..."""
+    ch = CHANNELS[channel_index % len(CHANNELS)]
+    try:
+        videos = fetch_rss(ch["id"])
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {
+        "channel_id":   ch["id"],
+        "channel_name": ch.get("name"),
+        "rss_url":      rss_url(ch["id"]),
+        "video_count":  len(videos),
+        "videos": [
+            {
+                "id":        v["id"],
+                "title":     v["title"],
+                "url":       v["url"],
+                "published": v["published"],
+                "channel":   v["channel_name"],
+            }
+            for v in videos
+        ],
+    }
